@@ -1,0 +1,9 @@
+[submodule "themes/hugo-book"]
+	path = themes/hugo-book
+	url = https://github.com/alex-shpak/hugo-book
+[submodule "themes/listed"]
+	path = themes/listed
+	url = https://github.com/zhongyujiang/listed.git
+[submodule "themes/jam"]
+	path = themes/jam
+	url = https://github.com/zhongyujiang/jam.git
