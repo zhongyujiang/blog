@@ -1,0 +1,122 @@
+---
+title: "抽象泄漏法则与其对实践的启发-记一次棘手的堆外内存问题的解决过程"
+date: 2023-09-28T21:41:34+08:00
+draft: false
+---
+
+
+### 前言
+
+1. 虽然文章标题里写了「抽象泄漏法则」和「棘手的堆外内存问题的解决过程」，但是这篇文章的重点既不在于对「抽象泄漏」的理解，也不在于总结「如何解决堆外内存问题」，这两个话题在网上都有很多经典、详实的资料可供参考。这篇文章的重点其实在于「启发」一词，如题，这篇文章是关于我在解决一个棘手堆外内存问题的过程中一直碰壁，最后终于从「抽象泄漏法则」中受到启发并找到最佳解法的记录，这个过程有些曲折但很有意义，我觉得把这个过程梳理、记录下来可以为将来遇到类似问题时提供参考和借鉴，兴许还可以启发他人；（糟糕的是，写完这篇文章并通读一遍后，我感觉这个「参考和借鉴」的意义似乎有些弱 / 不明显，不知道是不是文章逻辑没有梳理好的原因…）
+2. 之所以说这是一个棘手的问题，是因为 1. 这个问题确实是困扰了我很长一段时间；2. 这个问题发生在一个被广泛使用的在开源软件中 Apache Parquet-MR 中，并且存在了很长一段时间，据我所知有很多公司都在使用它的过程中遇到了这个问题，但一直以来并没有人能够真正解决这个问题（有替代的解法，但不完全正确，不是根本的解法），直到我找到了问题的根因所在，并向开源社区提交了修复。（这次开源社区的参与也让我真正体会到了开源的意义，回馈他人真的很有成就感！）我想这可以从侧面说明这个问题所隐藏之深。
+
+### 问题背景
+
+大约在一年半前，我们开始推动公司在数据湖仓中使用 ZSTD 作为数据的默认压缩算法，因为我发现相较于 Gzip / Snappy，ZSTD 可以**节省 30 ～ 60%  的存储空间**，大幅降低存储费用，同时数据体积减少带来了读写时巨大的带宽节省。我们在数据湖/数据仓库中使用的数据存储文件格式是 Parquet ，Parquet-MR 在 1.12.0 版本后自带 ZSTD 压缩功能，（在这之前 Parquet ZSTD 压缩依赖 Hadoop 安装环境）也就是说动只需将压缩配置参数改为 ZSTD 就可以轻松节省巨幅的成本！
+
+但是在切换到 ZSTD 之后，我们发现有一些 ETL 作业总是 OOM，排查后发现这些失败作业的共同点是处理的数据量较大，每个节点可能要读取几 GB 的数据量。并且测试这些 OOM 异常可以稳定复现，在作业运行时登上 executor 节点上一看，进程 RSS 不断上涨，几分钟就可以吃掉十几 GB 的内存，且查看 pmap 一看发现有大量的匿名 64MB 内存块，将这些内存块 dump 下来后发现里面内容都是 ETL 所处理数据的内容。接着又使用 profiler 进行内存采样，发现 90% 以上的内存分配都是在堆外，因为 Parquet 使用 zstd-jni 作为压缩编码执行器，所以都是堆外内存。
+
+### 第一次尝试解决无果
+
+这是我第一次处理这种堆外内存泄漏问题，从网上查到的同类型问题资料来看，这大概率是读取文件后的流没有关闭，导致堆外内存一直得不到释放，持续叠加造成 OOM。所以我的第一反应就是**从代码入手追踪是不是有没有关闭的读文件流**，然而我将 Iceberg Parquet Reader 的读取逻辑部分的代码前前后后完整的浏览 + Debug 四五遍后，也没有找到没有关闭的 InputStream 🤷‍♂️。
+
+### 在社区讨论中找到解法
+
+自己解决不了就只能求助社区了，我发现 Iceberg 的 Slack 群也有类似问题求助的帖子。并且有人直接给出了问题的原因与解决方法：这其实是由于 Glibc 内存回收机制的缺陷造成的，可以通过降低运行时的 `MALLOC_TRIM_THRESHOLD_` 来解决，通常来说将它调节到 8KiB 就可以解决问题（默认值为128KiB）：
+![Iceberg slack 中的讨论](/img/leaky-abstractions-and-OOM-post-imgs/slack-thread.png)
+                                Iceberg Slack 中的讨论给出的解法
+
+我对 Glibc 的内存回收机制其实并不了解，不过尝试过后发现这个方法确实可以完全解决之前遇到的 Parquet + ZSTD 的 OOM 问题。接着我自己也对 Glibc 对内存管理的机制做了一番了解，大概搞明白了这个解法其中的原理，简单来说：
+
+1. Glibc 默认使用 ptmalloc2 分配内存，ptmalloc2 会从系统申请「内存块」给用户使用，但是当这段「内存块」被用户 free 后，ptmalloc2 不会将它归还给系统，而是给自己管理了起来，后续再有用户申请内存，就先从自己管理的内存块列表中找到合适大小的「内存块」给用户，以避免反复向系统申请内存的开销；
+2. 但是 ptmalloc2 对内存的管理机制有缺陷，[不同生命周期的内存块容易造成内存碎片](https://stackoverflow.com/questions/60871/how-to-solve-memory-fragmentation)，不利于内存再利用和回收。按照上图中的解释，Parquet + ZSTD 的读取遇到的就是这个问题，ptmalloc2 对内存管理的缺陷导致大量的堆外内存得不到释放。好在 Glibc 提供了 `MALLOC_TRIM_THRESHOLD_` 配置让用户可以适当调优，`MALLOC_TRIM_THRESHOLD_` 这个参数的作用就是，Glibc  会将那些被 free 的资源中超过这个参数大小内存块直接释放给系统，而不是留下来自己管理。这样当然会增加向系统申请内存的开销，但是可以有效避免内存碎片问题。
+
+虽然了解了这背后的原理，但当时其实也还是有些怀疑这是不是真正的最优解，感觉一个 Java 程序需要通过调节 Glibc 的 Malloc 内存分配机制来解决内存问题似乎并不是不是那么的恰当，而且据我所知 Parquet-MR 使用的解压缩库 zstd-jni 应用十分广泛，但是我却并没有搜索到有其它使用 zstd-jni 的应用程序有出现类似的问题需要通过调节 Glibc 来解决的。
+
+不过除了这个解法外我也找不到其它任何有效的解法，所以我当时并没有再继续深挖下去，后续就将这个配置添加到了 Spark 集群的启动配置中，之前 OOM 的作业也确实都可以稳定正常运行。
+
+#### 社区解法的局限性
+
+但是好景不长，随着用 ZSTD Parquet 的表越来越多，一些 Flink Streaming 作业又遇到了之前同样的 OOM 问题，我们集群上的 Flink 引擎并不使用默认的 Glibc 而是使用 Jemalloc 作为内存分配器，而虽然上图中的回复说使用 Jemalloc 也是解决方法之一，但显然从实际情况来看并不是如此。我也将 Jemalloc 无法解决问题的这个问题反馈到了社区的话题中，然而并没有得到有效解法的回复…
+
+于是我想参考 Glibc 的解决方式，尝试通过调节 Jemalloc 的内存回收机制来控制堆外内存，然后在花了大概一周的时间了解 Jemalloc 的原理，并使用其提供的各种与内存回收相关的配置来避免堆外内存碎片后，仍然没有找到一点进展。我开始怀疑调节 malloc 这条路可能是走不通的，（当然也很有可能是我对 Jemalloc 的了解实在有限）至少可能并不是最佳的解法。
+
+虽然没有找到调节 Jemalloc 的方法，但梳理之前的排查过程后，我当时隐约可以感觉到之前的排查、思考的方向可能并不正确：
+
+1. 这肯定不是什么读文件时，打开文件却忘记关闭导致的内存泄漏，因为之前在使用 Snappy, Gzip 压缩时并没有什么问题，同样一套代码，虽然使用的是不同的压缩算法，但读文件的流程都是用的同一套代码；
+2. 通过调节堆外 malloc 来解决问题是有效的方法，但可能并不是最优解。ZSTD 压缩算法被使用的范围很广，但是我并没有查询到有其它应用在切换到 ZSTD 压缩后需要调节 malloc 配置的。
+
+在有了这些怀疑后，我想也许应该**重新审视**问题的根本原因所在，不过我却仍然没有任何具体的思路，可能还是经验偏少的原因🥲。
+
+### 从抽象泄漏法则中受到启发
+
+幸运的是，不久后我从 Joel Spolsky 的这篇博客： *[The Law of Leaky Abstractions](https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/)* 《抽象泄漏的法则》中受到了启发，终于开始意识到正确的问题追踪方向应该是什么，并且沿着新的解题思路，我真的找到了这个困扰我许久的问题的正确解决方法。当时真的有一种豁然开朗的感觉，下面我就简单阐述我对于这篇文章所提到的「抽象泄漏」的理解以及在 Parquet + ZSTD 这个问题上从中受到的启发。
+
+#### 理解抽象泄漏
+
+在软件开发领域，软件工程师们在开发过程中总是会需要与各种「抽象」打交道，「抽象层」可以隐藏程序实现背后的复杂性，赋予使用者封装起来的「功能」。借助这些「抽象」，开发者只用专注于自然业务层次的实现，可以在降低应用程序复杂度的同时提高开发效率。
+
+然而抽象都并非完美，Joel Spolsky 在其博客 ***[The Law of Leaky Abstractions](https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/)*** 中指出：
+
+> **All non-trivial abstractions, to some degree, are leaky.**
+>
+
+“在某种程度上，所有重要的抽象都是有漏洞的”，这就是所谓的抽象泄漏。如果软件开发者只是一味的使用抽象层的便利，但是不去了解抽象之下的技术细节，那么最终会被抽象泄漏拖垮。可以说开发时的 “蜜糖” 可能会变成交付后的 “砒霜”。
+
+简而言之，我认为可以从两个方面来理解这个「泄漏」：
+
+1. 从实现上来讲：抽象虽然可以帮助隐藏功能背后的复杂性，但是实现背后的细节往往会从抽象层级中“泄漏”出来，比如：
+
+    > [SQL](https://zh.wikipedia.org/wiki/SQL) 语言抽象了对数据库的操纵细节。允许数据库程序员只是描述想要做的目标。但是特定的SQL查询可能与其他等价的SQL查询有数千倍的性能差别。有个很有名的例子，在某个SQL服务器用"where a=b and b=c and a=c"来查询，会比用"where a=b and b=c"快上许多，虽然查询的结果是一样的。于是就得跳入更底层用查询规划分析器找出问题，然后想办法加快查询。
+    >
+
+    **所以说抽象机制虽然可以帮助开发者节省开发的过程，但却无法避免学习的过程。**
+
+2. 从机制上来讲：抽象也不是银弹，**抽象可以帮助隐藏实现，但是无法屏蔽现实**，因为抽象的功能也是有前提的，优秀的抽象设计往往会基于这些前提提供良好的 trade-off，这样使用者就可以在了解功能实现的原理后根据实际使用场景进行调节。但是当这些前提被直接 “斩断”，抽象所提供的保证便会直接不复存在。如  ***[The Law of Leaky Abstractions](https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/)* 中所提到的：**
+
+    > 当宠物蛇咬断了电脑的网线，任是 TCP 也无法保证消息传递的可靠性
+    >
+
+#### 新的解题思路
+
+上面一大段理解的核心其实可以归纳为一句话，就是原文中提到的：
+
+> “在某种程度上，所有重要的抽象都是有漏洞的”
+>
+
+现在重新回到读 Parquet + ZSTD OOM 的这个问题上来，对「抽象泄漏」有了大致的理解后，我突然想到，对于 Java 这门编程语言来说，其最大的抽象层之一就是其内存管理机制了，Java 提供自动的 Garbage collection 功能，但是自动 GC 的范围是有限的，我查到通过 [JNI](https://en.wikipedia.org/wiki/Java_Native_Interface#Pitfalls) 调用 native 程序申请的 non-JVM 资源是无法被 JVM 提供的自动 GC 回收的。
+
+另外当时也刚好留意到在 Spark 社区的一个与 ZSTD 压缩有关的修复 [patch](https://github.com/apache/spark/pull/35613) （这个 patch 修复一个 Spark 中调用 SparkPlan.decodeUnsafeRows 时没有关闭 ZSTD 压缩流的问题），再结合前面对先前排查思路的反思，我终于有了新的排查思路：这个 Parquet ZSTD 读取的内存问题的根本原因可能还是出在 Parquet Reader 在读取时对解压缩流的处理上有漏洞。
+
+然后我就把排查的方向放在了 Parquet 读取时处理解压缩流的代码上，果然发现 Parquet-MR 在解压缩时，并不会显式地关闭解压缩流，而是将其交给 GC 去释放，如下是 Parquet ZSTD 解压缩的调用栈：
+
+- 每次解压缩操作都会调用 `org.apache.parquet.hadoop.CodecFactory.HeapBytesDecompressor#decompress(org.apache.parquet.bytes.BytesInput, int)`，每次调用会构造好一个解压缩流 `org.apache.parquet.hadoop.codec.ZstdDecompressorStream` 供下游消费，它并不控制这个解压缩流的资源清理，所有资源清理工作都是交给 JVM 去做的；
+- `org.apache.parquet.hadoop.codec.ZstdDecompressorStream` 并不负解压缩，它只是一个包装类，包装了 `com.github.luben.zstd.ZstdInputStream` 对象，它有一个可以释放资源的`org.apache.parquet.hadoop.codec.ZstdDecompressorStream#close` 方法；
+- zstd-jni 中的 `com.github.luben.zstd.ZstdInputStream` 也并不是真正负责解压缩的类，真正负责解压缩的类是 `com.github.luben.zstd.ZstdInputStreamNoFinalizer`，如类名所示，这个类是没有 finalizer 的。其代理类 `com.github.luben.zstd.ZstdInputStream` 有一个 `#close` 方法可以释放 `ZstdInputStreamNoFinalizer` 的资源，但这个 *#close* 并没有被有效地利用。`ZstdInputStream` 还有一个 finalize 方法，JVM GC 时可以通过 finalize 清理掉其代理的 `ZstdInputStreamNoFinalizer` 中的资源（`ZstdInputStreamNoFinalizer#close`）；
+- `com.github.luben.zstd.ZstdInputStreamNoFinalizer`，这个类通过 JNI 调用 native 方法对数据进行解压缩（产生 non-JVM 资源），在 `com.github.luben.zstd.ZstdInputStreamNoFinalizer#close` 方法里面通过调用 native方法 `freeDStream` 实现对 non-JVM 资源的清理；
+
+Parquet-MR 读取过程中的解压缩的操作 `org.apache.parquet.hadoop.CodecFactory.HeapBytesDecompressor#decompress(org.apache.parquet.bytes.BytesInput, int)` 并不会立即将数据给解压缩，而只是构造一个解压缩流对象，真的的数据解压缩会在需要真正读取数据时进行，这样一来就**下游操作只需关心自己的解码逻辑即可，可以将「数据的解压缩」和「数据的解码」解耦**。但也因为这样，*HeapBytesDecompressor* 无法知道解压缩流什么时候才能被读取完，也无法知道会不会有二次读取的需求，**所以解压缩流的清理工作只能被交给 GC 进行。当 GC 回收 `com.github.luben.zstd.ZstdInputStream` 时，`ZstdInputStream` 的 `finalize` 方法会将堆外的 non-JVM 资源一并给回收掉。**
+
+当排查到这一步时，我其实还是有些怀疑这里的处理是否是有缺陷的，因为从上述的处理逻辑上来看，只要 GC 及时，堆外内存资源其实还是可以得到有效清理的。
+
+不过万一 GC 不及时呢？毕竟 JVM GC 虽然可以清理 *ZstdInputStreamNoFinalizer* 产生的 non-JVM 资源，但其实 JVM 并不能感知到它，也就是说这种**清理工作只是顺带性质的**，根本无法做到及时。所以我开始尝试通过在 Parquet 解压缩后直接关闭解压缩流来解决问题，修复非常简单，就增加了 1 行代码：
+
+`org.apache.parquet.hadoop.CodecFactory.HeapBytesDecompressor#decompress(org.apache.parquet.bytes.BytesInput, int)` 方法中构造解压缩流后提前触发真实的解压缩的操作，然后将解压缩的流给 *close* 掉，这样以来就可以立即完成对non-JVM 资源的清理了。
+
+![fix-code](/img/leaky-abstractions-and-OOM-post-imgs/fix-code.png)
+
+结果没想到这个解法十分奏效，在使用这个修复后，之前的 OOM 问题完全消失了，不管是 Glibc 还是 Jemalloc （两个都是默认配置，不需要调节 malloc）可以长时间稳定运行，可以说是终于彻底解决了这个困扰许久的问题。后续经过更多的测试和对修复后程序运行时的内存追踪，基本上确定了这个修复就是这个问题的根本解法了，应用这个修复后堆外内存从之前的几十 GB 降到了 几百 MB，并且十分稳定。
+
+所以我想这里的问题就在于程序运行时 JVM GC 往往是不及时的（ JVM 根本无法感知到堆外资源）：当堆内存充足时，JVM GC 并不频繁，这就会使得堆外内存一直得不到及时的释放，进而导致堆外内存碎片问题，最终呈现出的结果就是 Glibc 只能不断向系统申请新的内存块，直至发生 OOM。
+
+后来我做的 Benchmark 也从侧面印证了这一点，感觉真的是一个很有意思的现象😀：在下面图片表格中的最后两行， 当堆内存从 3GB 增加到 5 GB 后，运行时间反而大幅增加： 53s → 75s，同时 GC 次数大幅降低： 2174 次 → 950 次，但是与此同时，总的 GC 时间却大幅增加： 46s → 116s。
+
+![benchmark](/img/leaky-abstractions-and-OOM-post-imgs/benchmark.png)
+
+后来我也将这个发现向 Parquet 社区提了一个 Jira：[Close decompression stream to free off-heap memory in time](https://issues.apache.org/jira/browse/PARQUET-2160)，不过有些意外的是很长一段时间内社区并没有人有回复评论什么的😂，直到两个月后才有人回复说遇到了同样的问题，并且使用我在 Jira 中提出的方法可以有效解决。后续又在社区其他人的建议下提了修复的 [PR](https://github.com/apache/parquet-mr/pull/982) ，并且做了较为详细的 [Benchmark](https://github.com/apache/parquet-mr/pull/982)，最终这个修复也得以合并到社区仓库里。
+
+### 结束语
+
+虽然这个问题断断续续困扰了我一两个月的时间，但写完这篇文章后再回过头来看，我发现它似乎也并没有多么的复杂。在解决问题的过程中，我感受到的阻力其实还是来自于缺乏相关经验和专业知识储备不足，遇到的挑战其实也并不是问题本身所涉及的知识点复杂到难以理解（至少在解决这个问题上，并没有涉及到深奥的技术点），而其实是前期花了很多时间但一直找不到正确的解法导致有些有些挫败感，幸好最后坚持了下来并找到了突破口。
+
+这总结似乎有些鸡汤了，但我的经历告诉我现实工作确实是这样的。我后来也在开发工作中遇到过类似的挑战，需要进入自身不熟悉的领域完成开发任务，事前总是会有些紧张，感觉不懂的东西太多、自己的经验太少，有一堆的 blocker。但在事中、事后其实可以发现，即使任务所涉及的技术栈超越自身掌握，但只要有恒心、有章法地对问题进行分析、推进，保持定期回顾、梳理，保持发散思维，几乎是一定能逐步取得成果的。

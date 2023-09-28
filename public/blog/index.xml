@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Blogs on </title>
+    <link>http://example.org/blog/</link>
+    <description>Recent content in Blogs on </description>
+    <generator>Hugo -- gohugo.io</generator>
+    <language>en-us</language>
+    <lastBuildDate>Thu, 28 Sep 2023 21:41:34 +0800</lastBuildDate><atom:link href="http://example.org/blog/index.xml" rel="self" type="application/rss+xml" />
+    <item>
+      <title>抽象泄漏法则与其对实践的启发-记一次棘手的堆外内存问题的解决过程</title>
+      <link>http://example.org/blog/leaky-abstractions-and-oom-post/</link>
+      <pubDate>Thu, 28 Sep 2023 21:41:34 +0800</pubDate>
+      
+      <guid>http://example.org/blog/leaky-abstractions-and-oom-post/</guid>
+      <description>前言 虽然文章标题里写了「抽象泄漏法则」和「棘手的堆外内存问题的解决过程」，但是这篇文章的重点既不在于对「抽象泄漏」的理解，也不在于总结「如何解决堆外内存问题」，这两个话题在网上都有很多经典、详实的资料可供参考。这篇文章的重点其实在于「启发」一词，如题，这篇文章是关于我在解决一个棘手堆外内存问题的过程中一直碰壁，最后终于从「抽象泄漏法则」中受到启发并找到最佳解法的记录，这个过程有些曲折但很有意义，我觉得把这个过程梳理、记录下来可以为将来遇到类似问题时提供参考和借鉴，兴许还可以启发他人；（糟糕的是，写完这篇文章并通读一遍后，我感觉这个「参考和借鉴」的意义似乎有些弱 / 不明显，不知道是不是文章逻辑没有梳理好的原因…） 之所以说这是一个棘手的问题，是因为 1. 这个问题确实是困扰了我很长一段时间；2. 这个问题发生在一个被广泛使用的在开源软件中 Apache Parquet-MR 中，并且存在了很长一段时间，据我所知有很多公司都在使用它的过程中遇到了这个问题，但一直以来并没有人能够真正解决这个问题（有替代的解法，但不完全正确，不是根本的解法），直到我找到了问题的根因所在，并向开源社区提交了修复。（这次开源社区的参与也让我真正体会到了开源的意义，回馈他人真的很有成就感！）我想这可以从侧面说明这个问题所隐藏之深。 问题背景 大约在一年半前，我们开始推动公司在数据湖仓中使用 ZSTD 作为数据的默认压缩算法，因为我发现相较于 Gzip / Snappy，ZSTD 可以节省 30 ～ 60% 的存储空间，大幅降低存储费用，同时数据体积减少带来了读写时巨大的带宽节省。我们在数据湖/数据仓库中使用的数据存储文件格式是 Parquet ，Parquet-MR 在 1.12.0 版本后自带 ZSTD 压缩功能，（在这之前 Parquet ZSTD 压缩依赖 Hadoop 安装环境）也就是说动只需将压缩配置参数改为 ZSTD 就可以轻松节省巨幅的成本！
+但是在切换到 ZSTD 之后，我们发现有一些 ETL 作业总是 OOM，排查后发现这些失败作业的共同点是处理的数据量较大，每个节点可能要读取几 GB 的数据量。并且测试这些 OOM 异常可以稳定复现，在作业运行时登上 executor 节点上一看，进程 RSS 不断上涨，几分钟就可以吃掉十几 GB 的内存，且查看 pmap 一看发现有大量的匿名 64MB 内存块，将这些内存块 dump 下来后发现里面内容都是 ETL 所处理数据的内容。接着又使用 profiler 进行内存采样，发现 90% 以上的内存分配都是在堆外，因为 Parquet 使用 zstd-jni 作为压缩编码执行器，所以都是堆外内存。
+第一次尝试解决无果 这是我第一次处理这种堆外内存泄漏问题，从网上查到的同类型问题资料来看，这大概率是读取文件后的流没有关闭，导致堆外内存一直得不到释放，持续叠加造成 OOM。所以我的第一反应就是从代码入手追踪是不是有没有关闭的读文件流，然而我将 Iceberg Parquet Reader 的读取逻辑部分的代码前前后后完整的浏览 + Debug 四五遍后，也没有找到没有关闭的 InputStream 🤷‍♂️。</description>
+    </item>
+    
+    <item>
+      <title>Test</title>
+      <link>http://example.org/blog/test/</link>
+      <pubDate>Thu, 28 Sep 2023 21:33:37 +0800</pubDate>
+      
+      <guid>http://example.org/blog/test/</guid>
+      <description>屋檐 </description>
+    </item>
+    
+  </channel>
+</rss>
